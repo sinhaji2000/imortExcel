@@ -32,3 +32,8 @@ spring:
 app:
   import:
     storage-dir: ./uploads/imports
+
+logging:
+  level:
+    org.springframework.kafka: DEBUG
+    org.apache.kafka.clients.consumer: INFO

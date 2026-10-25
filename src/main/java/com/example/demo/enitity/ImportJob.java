@@ -24,7 +24,15 @@ public class ImportJob {
         @Column(nullable = false)
         private String status;
     
+        private int totalRows;
+        private int processedRows;
+        private int failedRows;
+
+        @Column(length = 2000)
+        private String errorMessage;
+
         private LocalDateTime createdAt;
+        private LocalDateTime completedAt;
 
         public ImportJob(String id, String filePath, String status) {
                 this.id = id;
