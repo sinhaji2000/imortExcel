@@ -1,10 +1,12 @@
+
 package com.example.demo.service;
 
 import com.example.demo.config.KafkaConfig;
 import com.example.demo.enitity.ImportJob;
 import com.example.demo.enitity.Student;
 import com.example.demo.repository.ImportJobRepository;
-import com.example.demo.repository.StudentRepository;
+
+import lombok.RequiredArgsConstructor;
 
 import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.Row;
@@ -23,17 +25,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 @Service
+@RequiredArgsConstructor
 public class ImportJobConsumer {
 
-    private final ImportJobRepository jobRepository;
-    private final StudentRepository studentRepository;
+    private static final int BATCH_SIZE = 100;
 
-    public ImportJobConsumer(
-            ImportJobRepository jobRepository,
-            StudentRepository studentRepository) {
-        this.jobRepository = jobRepository;
-        this.studentRepository = studentRepository;
-    }
+    private final ImportJobRepository jobRepository;
+    private final StudentBatchService studentBatchService;
 
     @KafkaListener(
             topics = KafkaConfig.IMPORT_TOPIC,
@@ -50,29 +48,45 @@ public class ImportJobConsumer {
             return;
         }
 
-        // Avoid processing a job that has already finished.
         if ("COMPLETED".equals(job.getStatus())
                 || "PROCESSING".equals(job.getStatus())) {
+
+            System.out.println(
+                    "Skipping job with status: " + job.getStatus());
             return;
         }
+
+        int totalRows = 0;
+        int processedRows = 0;
 
         try {
             job.setStatus("PROCESSING");
             job.setErrorMessage(null);
+            job.setCompletedAt(null);
+            job.setTotalRows(0);
+            job.setProcessedRows(0);
+            job.setFailedRows(0);
+
             jobRepository.save(job);
 
-            List<Student> students = new ArrayList<>();
             DataFormatter formatter = new DataFormatter();
+            List<Student> batch = new ArrayList<>(BATCH_SIZE);
 
             Path filePath = Path.of(job.getFilePath());
 
             try (InputStream input = Files.newInputStream(filePath);
                  Workbook workbook = WorkbookFactory.create(input)) {
 
+                if (workbook.getNumberOfSheets() == 0) {
+                    throw new IllegalArgumentException(
+                            "Excel file does not contain any sheet");
+                }
+
                 Sheet sheet = workbook.getSheetAt(0);
 
-                // Row 0 contains headers: name, email, age.
+                // Row 0 contains the header: name, email, age.
                 for (int i = 1; i <= sheet.getLastRowNum(); i++) {
+
                     Row row = sheet.getRow(i);
 
                     if (row == null || isBlankRow(row, formatter)) {
@@ -80,63 +94,98 @@ public class ImportJobConsumer {
                     }
 
                     String name = formatter
-                            .formatCellValue(row.getCell(0)).trim();
+                            .formatCellValue(row.getCell(0))
+                            .trim();
 
                     String email = formatter
-                            .formatCellValue(row.getCell(1)).trim();
-
-                    // String ageText = formatter
-                    //         .formatCellValue(row.getCell(2)).trim();
+                            .formatCellValue(row.getCell(1))
+                            .trim();
 
                     if (name.isEmpty() || email.isEmpty()) {
                         throw new IllegalArgumentException(
-                                "Required value missing at Excel row " + (i + 1));
+                                "Required name/email missing at Excel row "
+                                        + (i + 1));
                     }
 
-                    // int age;
-                    // try {
-                    //     age = Integer.parseInt(ageText);
-                    // } catch (NumberFormatException exception) {
-                    //     throw new IllegalArgumentException(
-                    //             "Invalid age at Excel row " + (i + 1));
-                    // }
+                    batch.add(new Student(name, email));
+                    totalRows++;
 
-                    students.add(new Student(name, email));
+                    if (batch.size() >= BATCH_SIZE) {
+
+                        studentBatchService.saveBatch(batch);
+
+                        processedRows += batch.size();
+                        batch.clear();
+
+                        updateProgress(job, totalRows, processedRows);
+
+                        System.out.println(
+                                "Progress: " + processedRows
+                                        + " rows saved for job " + jobId);
+                    }
+                }
+
+                // Save the last batch if fewer than BATCH_SIZE rows remain.
+                if (!batch.isEmpty()) {
+
+                    studentBatchService.saveBatch(batch);
+
+                    processedRows += batch.size();
+                    batch.clear();
+
+                    updateProgress(job, totalRows, processedRows);
                 }
             }
 
-            job.setTotalRows(students.size());
-            jobRepository.save(job);
-
-            // Save the parsed records after the full file has been read.
-            studentRepository.saveAll(students);
-
-            job.setProcessedRows(students.size());
+            job.setTotalRows(totalRows);
+            job.setProcessedRows(processedRows);
             job.setFailedRows(0);
             job.setStatus("COMPLETED");
             job.setCompletedAt(LocalDateTime.now());
             job.setErrorMessage(null);
+
             jobRepository.save(job);
 
             System.out.println(
                     "Import completed. Job ID: " + jobId
-                    + ", rows: " + students.size());
+                            + ", total rows: " + totalRows
+                            + ", processed rows: " + processedRows);
 
         } catch (Exception exception) {
+
+            job.setTotalRows(totalRows);
+            job.setProcessedRows(processedRows);
+            job.setFailedRows(Math.max(0, totalRows - processedRows));
             job.setStatus("FAILED");
             job.setCompletedAt(LocalDateTime.now());
             job.setErrorMessage(shortMessage(exception));
+
             jobRepository.save(job);
 
             System.err.println(
                     "Import failed. Job ID: " + jobId
-                    + ", reason: " + exception.getMessage());
+                            + ", reason: " + exception.getMessage());
         }
     }
 
+    private void updateProgress(
+            ImportJob job,
+            int totalRows,
+            int processedRows) {
+
+        job.setTotalRows(totalRows);
+        job.setProcessedRows(processedRows);
+
+        jobRepository.save(job);
+    }
+
     private boolean isBlankRow(Row row, DataFormatter formatter) {
+
         for (int i = 0; i < 3; i++) {
-            String value = formatter.formatCellValue(row.getCell(i)).trim();
+
+            String value = formatter
+                    .formatCellValue(row.getCell(i))
+                    .trim();
 
             if (!value.isEmpty()) {
                 return false;
@@ -147,6 +196,7 @@ public class ImportJobConsumer {
     }
 
     private String shortMessage(Exception exception) {
+
         String message = exception.getMessage();
 
         if (message == null || message.isBlank()) {
